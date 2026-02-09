@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SM64 Goddard Editor Addon",
     "author": "SI Silicon",
-    "blender": (2, 90, 0),
+    "blender": (4, 1, 0),
     "location": "View3D > Goddard",
     "wiki_url": "https://github.com/SIsilicon/Goddard-ImportExport-Project",
     "tracker_url": "https://github.com/SIsilicon/Goddard-ImportExport-Project/issues",
@@ -11,7 +11,7 @@ bl_info = {
 import bpy
 import sys
 import os
-import imp
+import importlib
 
 debug = __name__ == "__main__"
 
@@ -23,8 +23,9 @@ if debug:
 from . import import_goddard
 from . import export_goddard
 
-imp.reload(import_goddard)
-imp.reload(export_goddard)
+if debug:
+    importlib.reload(import_goddard)
+    importlib.reload(export_goddard)
     
 from bpy.props import (StringProperty, PointerProperty, BoolProperty)
 

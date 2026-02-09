@@ -44,33 +44,37 @@ def load_dynlist(filepath):
 def modify_dynlist(dynlist, object, vert_data_name, face_data_name, list_data_name):
     global max_vertex_count_in_mesh, total_vertex_count
     
+    # Clean up artifacts from previous broken exports.
+    # - Some regex backreferences were previously emitted literally (e.g. "\\1[28]\\2").
+    # - Some replacements accidentally inserted ASCII control characters (e.g. \x03) into EndGroup(...).
+    dynlist = dynlist.replace("\x03", "")
+    # Remove either "\1[NN]\2" or "\\1[NN]\\2" lines.
+    dynlist = re.sub(r"^[\\]1\[\d+\][\\]2\s*$\r?\n?", "", dynlist, flags=re.M)
+    dynlist = re.sub(r"^\\\\1\[\d+\]\\\\2\s*$\r?\n?", "", dynlist, flags=re.M)
+    # Also remove if it appears without being on its own line.
+    dynlist = re.sub(r"[\\]1\[\d+\][\\]2\s*\r?\n", "", dynlist)
+    dynlist = re.sub(r"\\\\1\[\d+\]\\\\2\s*\r?\n", "", dynlist)
+    
     # get a triangulated version of the object's mesh 
     tri_mod = object.modifiers.new("triangulate", "TRIANGULATE")
-    mesh = object.evaluated_get(curr_context.evaluated_depsgraph_get()).to_mesh()
+    depsgraph = curr_context.evaluated_depsgraph_get()
+    eval_obj = object.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
     object.modifiers.remove(tri_mod)
 
-    # insert vertex data into file
-    dynlist = re.sub(r"#define VTX_NUM (.*?)\n", "#define VTX_NUM " + str(len(mesh.vertices.values())) + " \n", dynlist, 1)
     vertex_data = []
-    for vertex in mesh.vertices.values():
+    for vertex in mesh.vertices:
         vertex_data.append([
             int(vertex.co[0] * 212.77),
-            int(vertex.co[1] * 212.77), 
+            int(vertex.co[1] * 212.77),
             int(vertex.co[2] * 212.77)
         ])
-    max_vertex_count_in_mesh = max(max_vertex_count_in_mesh, len(mesh.vertices.values()))
-    total_vertex_count += len(mesh.vertices.values())
+    max_vertex_count_in_mesh = max(max_vertex_count_in_mesh, len(mesh.vertices))
+    total_vertex_count += len(mesh.vertices)
     vertex_data = str(vertex_data).replace("[", "{").replace("]", "}")
-    dynlist = re.sub(
-        vert_data_name+r"\[VTX_NUM\](.+?)};",
-        vert_data_name+"[VTX_NUM][3] = " + vertex_data + ";",
-        dynlist, 1, re.S
-    )
 
-    # insert face data into file
-    dynlist = re.sub(r"#define FACE_NUM (.*?)\n", "#define FACE_NUM " + str(len(mesh.polygons.values())) + " \n", dynlist, 1)
     face_data = []
-    for face in mesh.polygons.values():
+    for face in mesh.polygons:
         face_data.append([
             face.material_index,
             face.vertices[0],
@@ -78,11 +82,34 @@ def modify_dynlist(dynlist, object, vert_data_name, face_data_name, list_data_na
             face.vertices[2]
         ])
     face_data = str(face_data).replace("[", "{").replace("]", "}")
-    dynlist = re.sub(
-        face_data_name+r"\[FACE_NUM\](.+?)};",
-        face_data_name+"[FACE_NUM][4] = " + face_data + ";",
-        dynlist, 1, re.S
-    )
+
+    # Insert vertex/face data into file.
+    # sm64coopdx dynlists do not use VTX_NUM/FACE_NUM; they use static arrays with ARRAY_COUNT().
+    if "#define VTX_NUM" in dynlist and "#define FACE_NUM" in dynlist:
+        dynlist = re.sub(r"#define VTX_NUM (.*?)\n", "#define VTX_NUM " + str(len(mesh.vertices)) + " \n", dynlist, 1)
+        dynlist = re.sub(
+            vert_data_name+r"\[VTX_NUM\](.+?)};",
+            vert_data_name+"[VTX_NUM][3] = " + vertex_data + ";",
+            dynlist, 1, re.S
+        )
+
+        dynlist = re.sub(r"#define FACE_NUM (.*?)\n", "#define FACE_NUM " + str(len(mesh.polygons)) + " \n", dynlist, 1)
+        dynlist = re.sub(
+            face_data_name+r"\[FACE_NUM\](.+?)};",
+            face_data_name+"[FACE_NUM][4] = " + face_data + ";",
+            dynlist, 1, re.S
+        )
+    else:
+        dynlist = re.sub(
+            r"(static\s+s16\s+" + re.escape(vert_data_name) + r"\s*\[\]\[3\]\s*=\s*)\{.*?\};",
+            lambda m: m.group(1) + vertex_data + ";",
+            dynlist, 1, re.S,
+        )
+        dynlist = re.sub(
+            r"(static\s+u16\s+" + re.escape(face_data_name) + r"\s*\[\]\[4\]\s*=\s*)\{.*?\};",
+            lambda m: m.group(1) + face_data + ";",
+            dynlist, 1, re.S,
+        )
     
     # insert material data into file
     material_data = []
@@ -99,17 +126,40 @@ def modify_dynlist(dynlist, object, vert_data_name, face_data_name, list_data_na
 
     list_length = 12 + len(material_data)
 
+    # If a previous broken export replaced the dynlist declaration with a literal backreference
+    # artifact (e.g. "\1[28]\2"), the sanitizer above will remove it. In that case, the list
+    # can be left without a `struct DynList ... = {` declaration, and `BeginList()` ends up at
+    # file scope, breaking compilation.
+    if ("struct DynList " + list_data_name) not in dynlist:
+        dynlist = re.sub(
+            r"^([ \t]*)BeginList\(\),",
+            lambda m: (
+                "struct DynList " + list_data_name + "[" + str(list_length) + "] = {\n"
+                + m.group(1) + "BeginList(),"
+            ),
+            dynlist, 1, re.M
+        )
+
     dynlist = re.sub(
-        list_data_name+r"\[(.+?)\]",
-        list_data_name+"["+str(list_length)+"]",
+        r"(struct\s+DynList\s+" + re.escape(list_data_name) + r"\s*)\[\s*\d+\s*\](\s*=\s*\{)",
+        lambda m: m.group(1) + "[" + str(list_length) + "]" + m.group(2),
         dynlist, 1
     )
-    material_data = "\n    ".join(material_data)
+    material_data = "\n".join(material_data)
     dynlist = re.sub(
-        r"StartGroup\((.+?)\)(.*?)EndGroup",
-        r"StartGroup(\1),\n    " + material_data + "\n    EndGroup",
-        dynlist, 1, re.S
+        r"(^[ \t]*)StartGroup\(([^)]*?)\)\s*,?(.*?)(^[ \t]*)EndGroup\(([^)]*?)\)\s*,?",
+        lambda m: (
+            m.group(1) + "StartGroup(" + m.group(2) + "),\n"
+            + ("" if not material_data else "\n".join(m.group(1) + "    " + line for line in material_data.split("\n")) + "\n")
+            + m.group(1) + "EndGroup(" + ((m.group(5).strip()) if m.group(5).strip() else m.group(2)) + "),\n"
+        ),
+        dynlist, 1, re.S | re.M
     )
+
+    try:
+        eval_obj.to_mesh_clear()
+    except Exception:
+        pass
 
     return dynlist, list_length
 
@@ -132,7 +182,12 @@ def modify_master_dynlist(dynlist, objects):
     }
     obj_id_map = {
         0xE1: "face", 0x3B: "eyebrow.L",
-        0x5D: "eyebrow.R", 0x19: "mustache"
+        0x5D: "eyebrow.R", 0x19: "mustache",
+
+        "DYNOBJ_MARIO_FACE_SHAPE": "face",
+        "DYNOBJ_MARIO_LEFT_EYEBROW_SHAPE": "eyebrow.L",
+        "DYNOBJ_MARIO_RIGHT_EYEBROW_SHAPE": "eyebrow.R",
+        "DYNOBJ_MARIO_MUSTACHE_SHAPE": "mustache",
     }
     
     i = 0
@@ -140,26 +195,36 @@ def modify_master_dynlist(dynlist, objects):
     object_weights = {}
     current_vert_group = None
     weight_begin, weight_end = -1, -1
+    had_any_weight_replacement = False
     while i < len(token_list):
         command, params = token_list[i]
         
         if command != "SetSkinWeight" and weight_begin != -1:
-            del token_list[weight_begin:weight_end]
-            
-            print(current_object.name, len(current_object.data.vertices))
-            weight_end = weight_begin
+            existing_weight_block = token_list[weight_begin:weight_end]
+
             sublist = []
-            vert_group_index = current_vert_group.index
-            
-            for j, vert in enumerate(current_object.data.vertices):
-                for grp in vert.groups:
-                    if grp.group == vert_group_index and grp.weight != 0.0: 
-                        sublist.append(["SetSkinWeight", (j, grp.weight * 100.0)])
-                        weight_end += 1
-            token_list[weight_begin:weight_begin] = sublist
-            
-            i = weight_end + 1
+            if current_object is not None and current_vert_group is not None:
+                print(current_object.name, len(current_object.data.vertices))
+                vert_group_index = current_vert_group.index
+
+                for j, vert in enumerate(current_object.data.vertices):
+                    for grp in vert.groups:
+                        if grp.group == vert_group_index and grp.weight != 0.0:
+                            sublist.append(["SetSkinWeight", (j, grp.weight * 100.0)])
+
+            # Only replace weights if we actually generated new ones.
+            # If vertex groups are missing/mismatched for a custom head, preserving original
+            # weights keeps cursor-driven deformation functioning.
+            if len(sublist) > 0:
+                del token_list[weight_begin:weight_end]
+                token_list[weight_begin:weight_begin] = sublist
+                had_any_weight_replacement = True
+                i = weight_begin + len(sublist) + 1
+            else:
+                i = weight_end + 1
+
             weight_begin = -1
+            weight_end = -1
             continue
 
         if command == "SetSkinShape":
@@ -171,8 +236,13 @@ def modify_master_dynlist(dynlist, objects):
 
             # use a version of the mesh with its modifiers applied
             bpy.ops.object.select_all(action="DESELECT")
-            objects[obj_id_map[params]].select_set(True)
-            curr_context.view_layer.objects.active = objects[obj_id_map[params]]
+            shape_key = params[0] if isinstance(params, tuple) else params
+            shape_name = obj_id_map.get(shape_key)
+            if shape_name is None or shape_name not in objects:
+                i += 1
+                continue
+            objects[shape_name].select_set(True)
+            curr_context.view_layer.objects.active = objects[shape_name]
             bpy.ops.object.duplicate()
             bpy.ops.object.modifier_add(type="TRIANGULATE")
             current_object = curr_context.view_layer.objects.active
@@ -195,8 +265,9 @@ def modify_master_dynlist(dynlist, objects):
         if command == "SetSkinWeight":
             if weight_begin == -1:
                 weight_begin = i
+                weight_end = i + 1
             else:
-                weight_end = i
+                weight_end = i + 1
         i+=1
     
     if current_object:
@@ -204,7 +275,7 @@ def modify_master_dynlist(dynlist, objects):
         current_object.select_set(True)
         curr_context.view_layer.objects.active = current_object
         bpy.ops.object.delete()
-    bpy.ops.outliner.orphans_purge()
+    bpy.ops.outliner.orphans_purge(do_recursive=True)
     
     list_string = "dynlist_mario_master["+str(len(token_list))+"] = {\n"
     indent = "    "
@@ -227,35 +298,29 @@ def modify_master_dynlist(dynlist, objects):
 
 def split_dynlists(dynlist):
     lists = []
-    
-    splitpoint = "#define VTX_NUM"
-    first_iteration = True
-    offset = 0
-    while len(dynlist) != 0:
-        offset = dynlist.find(splitpoint, 1)
-        
-        if offset == -1:
-            if first_iteration:
-                print("Invalid dynlist! Can't split.")
-                return
-            else:
-                lists.append(dynlist)
-                break
 
-        if offset != -1:
-            if first_iteration:
-                offset = dynlist.find(splitpoint, offset + 1)
-                if offset == -1:
-                    return dynlist
-                else:
-                    lists.append(dynlist[:offset])
-                    dynlist = dynlist[offset:]
-            else:
-                lists.append(dynlist[:offset])
-                dynlist = dynlist[offset:]
-        
-        first_iteration = False
-    
+    splitpoint = "#define VTX_NUM"
+    indices = []
+    start = 0
+    while True:
+        idx = dynlist.find(splitpoint, start)
+        if idx == -1:
+            break
+        indices.append(idx)
+        start = idx + len(splitpoint)
+
+    if len(indices) <= 1:
+        return [dynlist]
+
+    for i, idx in enumerate(indices):
+        if i + 1 < len(indices):
+            lists.append(dynlist[idx:indices[i + 1]])
+        else:
+            lists.append(dynlist[idx:])
+
+    if indices[0] != 0:
+        lists[0] = dynlist[:indices[0]] + lists[0]
+
     return lists
 
 def exceute(op, context):
@@ -313,26 +378,20 @@ def exceute(op, context):
 
     # load and modify the dynlist file that the face will be saved in.
     face_dynlist = load_dynlist(dynlist_files["face"])
-    face_dynlist, face_size = modify_dynlist(face_dynlist, goddard_meshes["face"], "mario_Face_VtxData", "mario_Face_FaceData", "dynlist_mario_face")
+    face_dynlist, face_size = modify_dynlist(face_dynlist, goddard_meshes["face"], "mario_Face_VtxData", "mario_Face_FaceData", "dynlist_mario_face_shape")
 
     # load and modify the dynlist file that the eyes will be saved in.
     eyes_dynlists = load_dynlist(dynlist_files["eyes"])
-    eyes_dynlists = split_dynlists(eyes_dynlists)
-
-    eyes_dynlists[0], eye_size_r = modify_dynlist(eyes_dynlists[0], goddard_meshes["eye.R"], "verts_mario_eye_right", "facedata_mario_eye_right", "dynlist_mario_eye_right")
-    eyes_dynlists[1], eye_size_l = modify_dynlist(eyes_dynlists[1], goddard_meshes["eye.L"], "verts_mario_eye_left", "facedata_mario_eye_left", "dynlist_mario_eye_left")
-    eyes_dynlists = "\n".join(eyes_dynlists)
+    eyes_dynlists, eye_size_r = modify_dynlist(eyes_dynlists, goddard_meshes["eye.R"], "verts_mario_eye_right", "facedata_mario_eye_right", "dynlist_mario_eye_right_shape")
+    eyes_dynlists, eye_size_l = modify_dynlist(eyes_dynlists, goddard_meshes["eye.L"], "verts_mario_eye_left", "facedata_mario_eye_left", "dynlist_mario_eye_left_shape")
 
     # load and modify the dynlist file that the eyebrows and mustache will be saved in.
     brow_stache_dynlists = load_dynlist(dynlist_files["eyebrows_mustache"])
-    brow_stache_dynlists = split_dynlists(brow_stache_dynlists)
+    brow_stache_dynlists, eyebrow_size_r = modify_dynlist(brow_stache_dynlists, goddard_meshes["eyebrow.R"], "verts_mario_eyebrow_right", "facedata_mario_eyebrow_right", "dynlist_mario_eyebrow_right_shape")
+    brow_stache_dynlists, eyebrow_size_l = modify_dynlist(brow_stache_dynlists, goddard_meshes["eyebrow.L"], "verts_mario_eyebrow_left", "facedata_mario_eyebrow_left", "dynlist_mario_eyebrow_left_shape")
+    brow_stache_dynlists, mustache_size = modify_dynlist(brow_stache_dynlists, goddard_meshes["mustache"], "verts_mario_mustache", "facedata_mario_mustache", "dynlist_mario_mustache_shape")
 
-    brow_stache_dynlists[0], eyebrow_size_r = modify_dynlist(brow_stache_dynlists[0], goddard_meshes["eyebrow.R"], "verts_mario_eyebrow_right", "facedata_mario_eyebrow_right", "dynlist_mario_eyebrow_right")
-    brow_stache_dynlists[1], eyebrow_size_l = modify_dynlist(brow_stache_dynlists[1], goddard_meshes["eyebrow.L"], "verts_mario_eyebrow_left", "facedata_mario_eyebrow_left", "dynlist_mario_eyebrow_left")
-    brow_stache_dynlists[2], mustache_size = modify_dynlist(brow_stache_dynlists[2], goddard_meshes["mustache"], "verts_mario_mustache", "facedata_mario_mustache", "dynlist_mario_mustache")
-    brow_stache_dynlists = "\n".join(brow_stache_dynlists)
-
-    os.makedirs(sm64_source_dir + "/goddard/dynlists/", exist_ok=True)
+    os.makedirs(sm64_source_dir + "/src/goddard/dynlists/", exist_ok=True)
 
     # write the dynlist lengths into the dynlists header file.
     with open(sm64_source_dir+"/src/goddard/dynlists/dynlists.h", "r") as src_head_file:
@@ -345,26 +404,26 @@ def exceute(op, context):
         header = re.sub(r"(dynlist_mario_eyebrow_left)\[(.+?)\]", r"\1["+str(eyebrow_size_l)+"]", header)
         header = re.sub(r"(dynlist_mario_mustache)\[(.+?)\]", r"\1["+str(mustache_size)+"]", header)
 
-        with open(sm64_source_dir+"/goddard/dynlists/dynlists.h", "w") as dest_head_file:
+        with open(sm64_source_dir+"/src/goddard/dynlists/dynlists.h", "w") as dest_head_file:
             dest_head_file.write(header)
 
     # write the dynlists into their respective files.
-    with open(sm64_source_dir+"/goddard/dynlists/dynlist_mario_master.c", 'w') as file:
+    with open(sm64_source_dir+"/src/goddard/dynlists/dynlist_mario_master.c", 'w') as file:
         if not "BLENDER" in face_dynlist:
             file.write("// MODIFIED BY A BLENDER ADDON //\n")
         file.write(master_dynlist)
 
-    with open(sm64_source_dir+"/goddard/dynlists/dynlist_mario_face.c", "w") as file:
+    with open(sm64_source_dir+"/src/goddard/dynlists/dynlist_mario_face.c", "w") as file:
         if not "BLENDER" in face_dynlist:
             file.write("// MODIFIED BY A BLENDER ADDON //\n")
         file.write(face_dynlist)
 
-    with open(sm64_source_dir+"/goddard/dynlists/dynlists_mario_eyes.c", "w") as file:
+    with open(sm64_source_dir+"/src/goddard/dynlists/dynlists_mario_eyes.c", "w") as file:
         if not "BLENDER" in eyes_dynlists:
             file.write("// MODIFIED BY A BLENDER ADDON //\n")
         file.write(eyes_dynlists)
 
-    with open(sm64_source_dir+"/goddard/dynlists/dynlists_mario_eyebrows_mustache.c", "w") as file:
+    with open(sm64_source_dir+"/src/goddard/dynlists/dynlists_mario_eyebrows_mustache.c", "w") as file:
         if not "BLENDER" in brow_stache_dynlists:
             file.write("// MODIFIED BY A BLENDER ADDON //\n")
         file.write(brow_stache_dynlists)
@@ -391,7 +450,7 @@ def exceute(op, context):
             code, 1, re.S
         )
     
-        with open(sm64_source_dir + "/goddard/renderer.c", 'w') as dst_file:
+        with open(sm64_source_dir + "/src/goddard/renderer.c", 'w') as dst_file:
             dst_file.write(code)
 
     # adjust maximum vertex count in dynlist_proc.c
@@ -399,7 +458,7 @@ def exceute(op, context):
         code = src_file.read()
         code = re.sub(r"(#define VTX_BUF_SIZE)(.*?)\n", r"\1 %d\n" % (max(max_vertex_count_in_mesh * 1.5, 3000.0)), code, 1, re.S)
 
-        with open(sm64_source_dir + "/goddard/dynlist_proc.c", 'w') as dst_file:
+        with open(sm64_source_dir + "/src/goddard/dynlist_proc.c", 'w') as dst_file:
             dst_file.write(code)
 
     return {'FINISHED'}
