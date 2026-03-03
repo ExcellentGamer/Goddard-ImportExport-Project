@@ -3,6 +3,7 @@ import sys
 import re
 import ast
 import os
+import struct
 from .dynlist_utils import tokenize_list
 
 # the file path to the sm64 source repo
@@ -34,6 +35,220 @@ GD_FREE_SUB = """
 curr_context = None
 total_vertex_count = 0
 max_vertex_count_in_mesh = 0
+
+# Joint ID mapping for GDB2 skin weights
+# Maps vertex group names to DYNOBJ_* joint IDs from dynlists.h
+# These MUST match the actual enum values in src/goddard/dynlists/dynlists.h
+JOINT_NAME_TO_ID = {
+    # Face joints (vertex group name -> DYNOBJ_*_JOINT_1 value)
+    "eyelid.L": 215,   # DYNOBJ_RIGHT_EYELID_JOINT_1 (R/L naming is swapped in original)
+    "eyelid.R": 206,   # DYNOBJ_LEFT_EYELID_JOINT_1
+    "jaw.R": 197,      # DYNOBJ_MARIO_RIGHT_JAW_JOINT
+    "jaw.L": 194,      # DYNOBJ_MARIO_LEFT_JAW_JOINT
+    "nose.1": 185,     # DYNOBJ_MARIO_NOSE_JOINT_1
+    "ear.R": 176,      # DYNOBJ_MARIO_RIGHT_EAR_JOINT_1
+    "ear.L": 167,      # DYNOBJ_MARIO_LEFT_EAR_JOINT_1
+    "cheek.R": 158,    # DYNOBJ_MARIO_RIGHT_LIP_CORNER_JOINT_1
+    "cheek.L": 149,    # DYNOBJ_MARIO_LEFT_LIP_CORNER_JOINT_1
+    "upper_lip": 140,  # DYNOBJ_MARIO_UNKNOWN_140
+    "forehead": 131,   # DYNOBJ_MARIO_CAP_JOINT_1
+    "eye.L": 106,      # DYNOBJ_MARIO_LEFT_EYE_JOINT_1
+    "eye.R": 122,      # DYNOBJ_MARIO_RIGHT_EYE_JOINT_1
+    "mustache.L": 15,  # DYNOBJ_MARIO_LEFT_MUSTACHE_JOINT_1
+    "mustache.R": 6,   # DYNOBJ_MARIO_RIGHT_MUSTACHE_JOINT_1
+    # Eyebrow joints
+    "eyebrow.L.L": 83, # DYNOBJ_MARIO_RIGHT_EYEBROW_RPART_JOINT_1
+    "eyebrow.R.L": 74, # DYNOBJ_MARIO_RIGHT_EYEBROW_LPART_JOINT_1
+    "eyebrow.L": 65,   # DYNOBJ_MARIO_RIGHT_EYEBROW_MPART_JOINT_1
+    "eyebrow.R.R": 49, # DYNOBJ_MARIO_LEFT_EYEBROW_LPART_JOINT_1
+    "eyebrow.L.R": 40, # DYNOBJ_MARIO_LEFT_EYEBROW_RPART_JOINT_1
+    "eyebrow.R": 31,   # DYNOBJ_MARIO_LEFT_EYEBROW_MPART_JOINT_1
+}
+
+def get_mesh_and_weights(obj, context, extract_weights=False):
+    """
+    Get triangulated vertex data, face data, and optionally skin weights
+    from a single mesh evaluation to ensure vertex indices match.
+    
+    Returns: (vertices, faces, joint_weights) where joint_weights is {} if not extracted
+    
+    Note: We duplicate and apply modifiers (like C export) rather than using
+    depsgraph evaluation, because depsgraph doesn't propagate vertex group
+    weights properly for subdivision modifiers.
+    """
+    # Duplicate the object so we can destructively apply modifiers
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+    bpy.ops.object.duplicate()
+    dup_obj = context.view_layer.objects.active
+    
+    # Add triangulate modifier
+    bpy.ops.object.modifier_add(type="TRIANGULATE")
+    
+    # Apply all modifiers except armature (same as C export)
+    for mod in list(dup_obj.modifiers):
+        try:
+            if mod.type == 'ARMATURE':
+                bpy.ops.object.modifier_remove(modifier=mod.name)
+            else:
+                bpy.ops.object.modifier_apply(modifier=mod.name)
+        except RuntimeError:
+            bpy.ops.object.modifier_remove(modifier=mod.name)
+    
+    # Force mesh data update
+    dup_obj.data.update()
+    mesh = dup_obj.data
+    
+    vertices = []
+    for vertex in mesh.vertices:
+        vertices.append([
+            int(vertex.co[0] * 212.77),
+            int(vertex.co[1] * 212.77),
+            int(vertex.co[2] * 212.77)
+        ])
+    
+    faces = []
+    for face in mesh.polygons:
+        faces.append([
+            face.material_index,
+            face.vertices[0],
+            face.vertices[1],
+            face.vertices[2]
+        ])
+    
+    joint_weights = {}
+    if extract_weights:
+        for vg in dup_obj.vertex_groups:
+            vg_name = vg.name
+            if vg_name not in JOINT_NAME_TO_ID:
+                continue
+            
+            joint_id = JOINT_NAME_TO_ID[vg_name]
+            weights = []
+            
+            for vert_idx, vert in enumerate(mesh.vertices):
+                for grp in vert.groups:
+                    if grp.group == vg.index and grp.weight > 0.001:
+                        weights.append((vert_idx, grp.weight * 100.0))
+            
+            if weights:
+                joint_weights[joint_id] = weights
+    
+    # Delete the duplicate
+    bpy.ops.object.select_all(action='DESELECT')
+    dup_obj.select_set(True)
+    context.view_layer.objects.active = dup_obj
+    bpy.ops.object.delete()
+    
+    return vertices, faces, joint_weights
+
+def get_mesh_data(obj, context):
+    """Get triangulated vertex and face data from a mesh object."""
+    vertices, faces, _ = get_mesh_and_weights(obj, context, extract_weights=False)
+    return vertices, faces
+
+def get_skin_weights(obj, context):
+    """
+    Extract skin weights from vertex groups for GDB2 format.
+    Returns a dict: {joint_id: [(vertex_idx, weight), ...]}
+    """
+    _, _, joint_weights = get_mesh_and_weights(obj, context, extract_weights=True)
+    return joint_weights
+
+def write_gdb2_mesh(f, vertices, faces):
+    """Write a single mesh (vertices + faces) in GDB2 format."""
+    vtx_count = len(vertices)
+    tri_count = len(faces)
+    
+    f.write(struct.pack('<I', vtx_count))
+    f.write(struct.pack('<I', tri_count))
+    
+    for vtx in vertices:
+        f.write(struct.pack('<hhh', vtx[0], vtx[1], vtx[2]))
+    
+    for face in faces:
+        f.write(struct.pack('<HHHH', face[0], face[1], face[2], face[3]))
+
+def write_gdb2_skin_weights(f, all_joint_weights):
+    """Write skin weight data in GDB2 format."""
+    joint_count = len(all_joint_weights)
+    f.write(struct.pack('<I', joint_count))
+    
+    for joint_id, weights in all_joint_weights.items():
+        f.write(struct.pack('<I', joint_id))
+        f.write(struct.pack('<I', len(weights)))
+        
+        for vtx_idx, weight in weights:
+            f.write(struct.pack('<H', vtx_idx))
+            f.write(struct.pack('<f', weight))
+
+def export_gdb2(op, context, filepath):
+    """
+    Export Goddard head to GDB2 binary format with skin weights.
+    This format supports variable poly counts.
+    """
+    global curr_context
+    curr_context = context
+    goddard_head = context.active_object
+    
+    if not goddard_head:
+        op.report({'ERROR'}, "A goddard head is not selected!")
+        return {'CANCELLED'}
+    
+    goddard_children = goddard_head.children
+    goddard_meshes = {}
+    mesh_names = ["eye.L", "eye.R", "eyebrow.L", "eyebrow.R", "face", "mustache"]
+    
+    for mesh in goddard_children:
+        if "eye.L" in mesh.name:
+            goddard_meshes["eye.L"] = mesh
+        elif "eye.R" in mesh.name:
+            goddard_meshes["eye.R"] = mesh
+        elif "eyebrow.L" in mesh.name:
+            goddard_meshes["eyebrow.L"] = mesh
+        elif "eyebrow.R" in mesh.name:
+            goddard_meshes["eyebrow.R"] = mesh
+        elif "face" in mesh.name:
+            goddard_meshes["face"] = mesh
+        elif "mustache" in mesh.name:
+            goddard_meshes["mustache"] = mesh
+    
+    if len(goddard_meshes.items()) != 6:
+        missing_meshes = [name for name in mesh_names if name not in goddard_meshes.keys()]
+        op.report({'ERROR'}, "The selected object does not have the following mesh children: %s" % str(missing_meshes))
+        return {'CANCELLED'}
+    
+    mesh_order = ["face", "eye.R", "eye.L", "eyebrow.R", "eyebrow.L", "mustache"]
+    
+    # Meshes that have skin weights (face has most, eyebrows and mustache have their own)
+    meshes_with_weights = ["face", "eyebrow.R", "eyebrow.L", "mustache"]
+    
+    all_joint_weights = {}
+    
+    with open(filepath, 'wb') as f:
+        f.write(b'GDB2')
+        f.write(struct.pack('<I', 2))
+        f.write(struct.pack('<I', 0))
+        
+        for mesh_name in mesh_order:
+            obj = goddard_meshes[mesh_name]
+            # Extract weights from face, eyebrows, and mustache (not eyes)
+            extract_weights = (mesh_name in meshes_with_weights)
+            vertices, faces, joint_weights = get_mesh_and_weights(obj, context, extract_weights)
+            write_gdb2_mesh(f, vertices, faces)
+            
+            if extract_weights:
+                all_joint_weights.update(joint_weights)
+        
+        if len(all_joint_weights) == 0:
+            op.report({'ERROR'}, "GDB2 export requires vertex groups on the face mesh! No valid skin weights found. Please ensure the face mesh has vertex groups matching joint names (e.g., 'eye.L', 'jaw', 'nose', etc.).")
+            return {'CANCELLED'}
+        
+        write_gdb2_skin_weights(f, all_joint_weights)
+    
+    op.report({'INFO'}, f"Exported GDB2 to {filepath}")
+    return {'FINISHED'}
 
 def load_dynlist(filepath):
     text = ""
@@ -168,7 +383,11 @@ def modify_master_dynlist(dynlist, objects):
     
     token_list = tokenize_list(dynlist)
     
+    
+    # Maps joint IDs/names to vertex group names
+    # Must match the names created by import_goddard.py's bone_id_map
     weight_id_map = {
+        # Numeric IDs (legacy format)
         0xD7: "eye.L", 0xCE: "eye.R",
         0xC5: "face?", 0xC2: "jaw",
         0xB9: "nose", 0xB0: "ear.L",
@@ -178,7 +397,30 @@ def modify_master_dynlist(dynlist, objects):
         0x0F: "mustache.L", 0x06: "mustache.R",
         0x53: "eyebrow.L.L", 0x4A: "eyebrow.R.L",
         0x41: "eyebrow.L", 0x31: "eyebrow.R.R",
-        0x28: "eyebrow.L.R", 0x1F: "eyebrow.R"
+        0x28: "eyebrow.L.R", 0x1F: "eyebrow.R",
+        # Symbolic names (current dynlist format) - must match import_goddard.py bone_id_map
+        "DYNOBJ_RIGHT_EYELID_JOINT_1": "eyelid.L",
+        "DYNOBJ_LEFT_EYELID_JOINT_1": "eyelid.R",
+        "DYNOBJ_MARIO_RIGHT_JAW_JOINT": "jaw.R",
+        "DYNOBJ_MARIO_LEFT_JAW_JOINT": "jaw.L",
+        "DYNOBJ_MARIO_NOSE_JOINT_1": "nose.1",
+        "DYNOBJ_MARIO_NOSE_JOINT_2": "nose.2",
+        "DYNOBJ_MARIO_RIGHT_EAR_JOINT_1": "ear.R",
+        "DYNOBJ_MARIO_LEFT_EAR_JOINT_1": "ear.L",
+        "DYNOBJ_MARIO_RIGHT_LIP_CORNER_JOINT_1": "cheek.R",
+        "DYNOBJ_MARIO_LEFT_LIP_CORNER_JOINT_1": "cheek.L",
+        "DYNOBJ_MARIO_UNKNOWN_140": "upper_lip",
+        "DYNOBJ_MARIO_CAP_JOINT_1": "forehead",
+        "DYNOBJ_MARIO_LEFT_EYE_JOINT_1": "eye.L",
+        "DYNOBJ_MARIO_RIGHT_EYE_JOINT_1": "eye.R",
+        "DYNOBJ_MARIO_LEFT_MUSTACHE_JOINT_1": "mustache.L",
+        "DYNOBJ_MARIO_RIGHT_MUSTACHE_JOINT_1": "mustache.R",
+        "DYNOBJ_MARIO_RIGHT_EYEBROW_RPART_JOINT_1": "eyebrow.L.L",
+        "DYNOBJ_MARIO_RIGHT_EYEBROW_LPART_JOINT_1": "eyebrow.R.L",
+        "DYNOBJ_MARIO_RIGHT_EYEBROW_MPART_JOINT_1": "eyebrow.L",
+        "DYNOBJ_MARIO_LEFT_EYEBROW_LPART_JOINT_1": "eyebrow.R.R",
+        "DYNOBJ_MARIO_LEFT_EYEBROW_RPART_JOINT_1": "eyebrow.L.R",
+        "DYNOBJ_MARIO_LEFT_EYEBROW_MPART_JOINT_1": "eyebrow.R",
     }
     obj_id_map = {
         0xE1: "face", 0x3B: "eyebrow.L",
@@ -204,7 +446,6 @@ def modify_master_dynlist(dynlist, objects):
 
             sublist = []
             if current_object is not None and current_vert_group is not None:
-                print(current_object.name, len(current_object.data.vertices))
                 vert_group_index = current_vert_group.index
 
                 for j, vert in enumerate(current_object.data.vertices):
@@ -246,20 +487,30 @@ def modify_master_dynlist(dynlist, objects):
             bpy.ops.object.duplicate()
             bpy.ops.object.modifier_add(type="TRIANGULATE")
             current_object = curr_context.view_layer.objects.active
-            for mod in current_object.modifiers:
+            # Must iterate over a copy - applying/removing modifies the collection
+            for mod in list(current_object.modifiers):
                 try:
-                    if isinstance(mod, bpy.types.ArmatureModifier):
+                    # Use mod.type for Blender 4.x compatibility
+                    if mod.type == 'ARMATURE':
                         bpy.ops.object.modifier_remove(modifier=mod.name)
                     else:
                         bpy.ops.object.modifier_apply(modifier=mod.name)
                 except RuntimeError:
                     bpy.ops.object.modifier_remove(modifier=mod.name)
             
+            # Force mesh data update after modifier application (needed for Blender 4.x)
+            current_object.data.update()
+            
             for vert_group in current_object.vertex_groups:
                 object_weights[vert_group.name] = vert_group
-        elif command == "AttachNetToJoint":
-            if params[1] in weight_id_map:
-                current_vert_group = object_weights[weight_id_map[params[1]]]
+        elif command == "MakeAttachedJoint":
+            # params is the joint ID/name (single value, not tuple)
+            joint_id = params[0] if isinstance(params, tuple) else params
+            if joint_id in weight_id_map:
+                vg_name = weight_id_map[joint_id]
+                current_vert_group = object_weights.get(vg_name, None)
+                if current_vert_group is None:
+                    pass
             else:
                 current_vert_group = None
         if command == "SetSkinWeight":

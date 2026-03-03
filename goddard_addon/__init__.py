@@ -27,7 +27,8 @@ if debug:
     importlib.reload(import_goddard)
     importlib.reload(export_goddard)
     
-from bpy.props import (StringProperty, PointerProperty, BoolProperty)
+from bpy.props import (StringProperty, PointerProperty, BoolProperty, EnumProperty)
+from bpy_extras.io_utils import ExportHelper
 
 from bpy.types import (
    Panel,
@@ -67,6 +68,23 @@ class ExportGoddard(Operator):
         return export_goddard.exceute(self, context)
 
 
+class ExportGoddardGDB2(Operator, ExportHelper):
+    bl_label = "Export Goddard GDB2"
+    bl_idname = "gd.export_goddard_gdb2"
+    bl_description = "Export the head to GDB2 binary format with skin weights.\nThis format supports variable poly counts for DynOS packs."
+    
+    filename_ext = ".gdbin"
+    
+    filter_glob: StringProperty(
+        default="*.gdbin",
+        options={'HIDDEN'},
+        maxlen=255,
+    )
+
+    def execute(self, context):
+        return export_goddard.export_gdb2(self, context, self.filepath)
+
+
 class GoddardUI(Panel):
     bl_label = "Goddard Import Export"
     bl_idname = "OBJECT_PT_goddard_panel"
@@ -84,10 +102,15 @@ class GoddardUI(Panel):
 
         layout.operator("gd.import_goddard")
         layout.operator("gd.export_goddard")
+        
+        layout.separator()
+        layout.label(text="DynOS Pack Export:")
+        layout.operator("gd.export_goddard_gdb2")
 
 classes = (
     ImportGoddard,
     ExportGoddard,
+    ExportGoddardGDB2,
     GoddardProperties,
     GoddardUI
 )

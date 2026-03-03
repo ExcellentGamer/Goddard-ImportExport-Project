@@ -310,18 +310,29 @@ def load_data_from_master_list(filepath, objects):
                     bpy.ops.object.parent_set()
     
             elif command == "MakeAttachedJoint":
-                # remove_empty_weights()
-                # curr_weights = mesh_weights[curr_mesh].setdefault(params, [])
+                # Save previous joint's weights before starting new joint
+                if curr_bone_idx and curr_mesh and len(curr_weights) > 0:
+                    if curr_mesh not in mesh_weights:
+                        mesh_weights[curr_mesh] = {}
+                    mesh_weights[curr_mesh][curr_bone_idx] = curr_weights
+                
+                curr_weights = []
 
                 select_object(curr_armature)
                 bpy.ops.object.mode_set(mode='EDIT', toggle=False)
-                curr_bone_idx = DynObjLUT[params]
+                curr_bone_idx = params
                 curr_bone = curr_armature.data.edit_bones.new("bone")
 
                 if params in bone_id_map.keys():
-                    curr_bone.name = bone_id_map[params]
+                    bone_name = bone_id_map[params]
+                elif isinstance(params, int):
+                    bone_name = f"joint_0x{params:02X}"
+                elif isinstance(params, str):
+                    bone_name = params
                 else:
-                    curr_bone.name = params
+                    bone_name = repr(params)
+                
+                curr_bone.name = bone_name
 
                 # curr_bone.name = "TESTBONE"+str(hash(time.time()))
 
@@ -331,20 +342,40 @@ def load_data_from_master_list(filepath, objects):
                 bpy.ops.object.mode_set(mode='OBJECT')
 
 
-                print("Attach Net %s to Joint %s" % (curr_armature.name, curr_bone.name))
+                print("Attach Net %s to Joint %s" % (curr_armature.name, bone_name))
 
                 objects[params] = curr_bone
                 bone_armature_map[curr_bone] = curr_armature
             elif command == "SetSkinWeight":
                 curr_weights.append((params[0], params[1] / 100.0))
         
+        # Save last joint's weights
+        if curr_bone_idx and curr_mesh and len(curr_weights) > 0:
+            if curr_mesh not in mesh_weights:
+                mesh_weights[curr_mesh] = {}
+            mesh_weights[curr_mesh][curr_bone_idx] = curr_weights
         
-        # remove_empty_weights()
-        # for obj, _id in obj_id_map.items():
-        #     for name, weights in mesh_weights[_id].items():
-        #         vert_group = objects[obj].vertex_groups.new(name=bone_id_map[name])
-        #         for index, weight in weights:
-        #             vert_group.add([index], weight, "REPLACE")
+        # Apply collected weights to mesh vertex groups
+        for obj_name, mesh_id in obj_id_map.items():
+            if mesh_id not in mesh_weights:
+                continue
+            if obj_name not in objects:
+                continue
+            
+            mesh_obj = objects[obj_name]
+            for joint_id, weights in mesh_weights[mesh_id].items():
+                # Get the bone name for this joint
+                if joint_id in bone_id_map:
+                    vg_name = bone_id_map[joint_id]
+                elif isinstance(joint_id, int):
+                    vg_name = f"joint_0x{joint_id:02X}"
+                else:
+                    vg_name = str(joint_id)
+                
+                # Create vertex group and add weights
+                vert_group = mesh_obj.vertex_groups.new(name=vg_name)
+                for index, weight in weights:
+                    vert_group.add([index], weight, "REPLACE")
 
 
 def execute(op, context):
