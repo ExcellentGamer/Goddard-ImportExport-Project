@@ -19,7 +19,9 @@ As you can see, you'll find the controls here in the 3D viewport. It's quite sim
 - Then import the head the source already has (it takes from the source)
 - Edit the imported head to your heart's content. Be sure that it still has all of its weights. They're really important.
 - Once you're done, select the head root (The sphere empty) and chose which format you would like to export to, pressing "Export Goddard to SM64" exports the C files directly to the repository, pressing "Export Goddard GDB2" will open a window asking where you want to save the .gdbin file:
+
 ![export_window](doc_images/export_window.png)
+
 On the render96dx repository you can export a Goddard for each player that is in the base C player select. These include:
 - mario_head.gdbin
 - luigi_head.gdbin
